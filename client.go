@@ -7,18 +7,20 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
-const (
-	method      = "POST"
-	contentType = "application/json"
-	resource    = "/api/logs"
-)
+// Client interface
+type Client interface {
+	PostData(*[]byte, string) error
+}
 
-// client posts messages to OMS
+// Client posts messages to OMS
 type client struct {
 	customerID      string
 	sharedKey       string
@@ -26,12 +28,17 @@ type client struct {
 	httpPostTimeout time.Duration
 }
 
-// Client interface
-type Client interface {
-	PostData(*[]byte, string) error
+const (
+	method      = "POST"
+	contentType = "application/json"
+	resource    = "/api/logs"
+)
+
+func init() {
+	http.DefaultClient.Timeout = time.Second * 30
 }
 
-// NewOmsClient object
+// NewOmsClient creates a new instance of the Client
 func NewOmsClient(customerID string, sharedKey string, postTimeout time.Duration) Client {
 	return &client{
 		customerID:      customerID,
@@ -41,46 +48,64 @@ func NewOmsClient(customerID string, sharedKey string, postTimeout time.Duration
 	}
 }
 
+// PostData posts message to OMS
 func (c *client) PostData(msg *[]byte, logType string) error {
 	// Headers
 	contentLength := len(*msg)
-	rfc1123date := time.Now().UTC().Format(time.RFC1123)
-	//TODO: rfc1123 date should have UTC offset
-	rfc1123date = strings.Replace(rfc1123date, "UTC", "GMT", 1)
-	//Signature
-	signature, err := c.buildSignature(rfc1123date, contentLength, method, contentType, resource)
-	if err != nil {
-		return err
-	}
-	// Create request
-	req, err := http.NewRequest("POST", c.url, bytes.NewBuffer(*msg))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", signature)
-	req.Header.Set("Log-Type", logType)
-	//TODO: headers should be case insentitive
-	//req.Header.Set("x-ms-date", rfc1123date)
-	req.Header["x-ms-date"] = []string{rfc1123date}
-	req.Header.Set("Content-Type", "application/json")
 
-	client := http.Client{
-		Timeout: c.httpPostTimeout,
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
+	if contentLength != 0 {
+		logrus.Infof("\nSending %s to %s. That is %d in length", string((*msg)[:]), c.url, contentLength)
+		rfc1123date := time.Now().UTC().Format(time.RFC1123)
+		//TODO: rfc1123 date should have UTC offset
+		rfc1123date = strings.Replace(rfc1123date, "UTC", "GMT", 1)
+		//Signature
+		signature, err := c.buildSignature(rfc1123date, contentLength, method, contentType, resource)
+		if err != nil {
+			return err
+		}
+		// Create request
+		req, err := http.NewRequest("POST", c.url, bytes.NewBuffer(*msg))
+		if err != nil {
+			return err
+		}
 
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 || resp.StatusCode < 200 {
-		return fmt.Errorf("Post Error. HTTP response code:%d message:%s", resp.StatusCode, resp.Status)
+		req.Header.Set("Authorization", signature)
+		req.Header.Set("Log-Type", logType)
+		//TODO: headers should be case insentitive
+		//req.Header.Set("x-ms-date", rfc1123date)
+		req.Header["x-ms-date"] = []string{rfc1123date}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Length", string(contentLength))
+
+		client := http.Client{
+			Timeout: c.httpPostTimeout,
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+
+		requestDump, err := httputil.DumpRequest(req, true)
+		if err != nil {
+			logrus.Fatalf("%v", err)
+		}
+		logrus.Infof("REQUEST: %s", string(requestDump))
+
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(resp.Body)
+
+		defer resp.Body.Close()
+		fmt.Printf("\n%d status: %s", resp.StatusCode, resp.Status)
+
+		if resp.StatusCode >= 300 || resp.StatusCode < 200 {
+			return fmt.Errorf("Post Error. HTTP response code:%d message:%s", resp.StatusCode, resp.Status)
+		}
+		return nil
 	}
 	return nil
 }
 
-// initial signature builder
-// to update later
 func (c *client) buildSignature(date string, contentLength int, method string, contentType string, resource string) (string, error) {
 	xHeaders := "x-ms-date:" + date
 	stringToHash := method + "\n" + strconv.Itoa(contentLength) + "\n" + contentType + "\n" + xHeaders + "\n" + resource
